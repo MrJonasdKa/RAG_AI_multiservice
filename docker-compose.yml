@@ -1,0 +1,57 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: rag-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./data-service/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  data-service:
+    build: ./data-service
+    container_name: rag-data-service
+    restart: unless-stopped
+    env_file:
+      - ./data-service/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+
+  ai-service:
+    build: ./ai-service
+    container_name: rag-ai-service
+    restart: unless-stopped
+    env_file:
+      - ./ai-service/.env
+    depends_on:
+      - data-service
+    ports:
+      - "8002:8000"
+
+  gateway:
+    build: ./gateway
+    container_name: rag-gateway
+    restart: unless-stopped
+    env_file:
+      - ./gateway/.env
+    depends_on:
+      - ai-service
+      - data-service
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:

@@ -1,0 +1,21 @@
+# Environment files (secrets — never commit)
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Docker
+*.log
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
