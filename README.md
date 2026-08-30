@@ -27,10 +27,31 @@ HTTP (internal network via Docker Compose).
    - http://localhost:8001/health (data-service, direct — not exposed in prod)
    - http://localhost:8002/health (ai-service, direct — not exposed in prod)
 
+## Ingesting the knowledge base
+
+```
+python scripts/fetch_postgres_docs.py   # pulls + cleans a starter set of PG docs into docs_raw/
+python scripts/ingest_docs.py           # chunks + embeds + stores each file via data-service
+```
+
+Then try a search directly against data-service:
+```
+curl "http://localhost:8001/chunks/search?query=how+does+an+index+speed+up+a+query"
+```
+
+## Running tests
+
+```
+docker compose exec data-service pytest   # needs the DB (health test) — chunking tests run anywhere
+docker compose exec ai-service pytest
+docker compose exec gateway pytest
+```
+
 ## Roadmap for this project (see /docs or main roadmap for full detail)
 
-- [ ] Ingestion pipeline (chunking + metadata tagging)
-- [ ] Embedding + storage via data-service
+- [x] Ingestion pipeline (chunking + metadata tagging)
+- [x] Embedding + storage via data-service
+- [x] Basic vector search endpoint (`GET /chunks/search`)
 - [ ] Hybrid retrieval (vector + BM25)
 - [ ] Re-ranking step
 - [ ] Source citations in answers
