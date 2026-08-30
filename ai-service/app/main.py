@@ -5,10 +5,13 @@ Nothing outside this service calls the Gemini API directly.
 """
 
 import os
+import re
+import time
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai.types import EmbedContentConfig
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -45,21 +48,46 @@ class EmbedResponse(BaseModel):
     embeddings: list[list[float]]
 
 
+GEMINI_MAX_BATCH = 100  # Gemini's embed_content batch limit
+MAX_RETRIES = 5
+RETRY_DELAY_RE = re.compile(r"retry in ([\d.]+)s", re.IGNORECASE)
+
+
+def _embed_batch_with_retry(client: genai.Client, batch: list[str], task_type: str):
+    for attempt in range(MAX_RETRIES):
+        try:
+            return client.models.embed_content(
+                model=GEMINI_EMBEDDING_MODEL,
+                contents=batch,
+                config=EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=GEMINI_EMBEDDING_DIM,
+                ),
+            )
+        except genai_errors.ClientError as e:
+            is_rate_limit = getattr(e, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e)
+            if not is_rate_limit or attempt == MAX_RETRIES - 1:
+                raise
+            match = RETRY_DELAY_RE.search(str(e))
+            delay = float(match.group(1)) + 1 if match else (2 ** attempt) * 5
+            time.sleep(delay)
+
+    raise RuntimeError("unreachable")  # loop always returns or raises
+
+
 @app.post("/embed", response_model=EmbedResponse)
 def embed(req: EmbedRequest):
     if not req.texts:
         raise HTTPException(400, "texts must not be empty")
 
     client = get_client()
-    response = client.models.embed_content(
-        model=GEMINI_EMBEDDING_MODEL,
-        contents=req.texts,
-        config=EmbedContentConfig(
-            task_type=req.task_type,
-            output_dimensionality=GEMINI_EMBEDDING_DIM,
-        ),
-    )
-    vectors = [e.values for e in response.embeddings]
+    vectors: list[list[float]] = []
+
+    for i in range(0, len(req.texts), GEMINI_MAX_BATCH):
+        batch = req.texts[i : i + GEMINI_MAX_BATCH]
+        response = _embed_batch_with_retry(client, batch, req.task_type)
+        vectors.extend(e.values for e in response.embeddings)
+
     return EmbedResponse(embeddings=vectors)
 
 

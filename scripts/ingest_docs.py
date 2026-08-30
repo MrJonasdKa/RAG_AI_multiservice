@@ -9,11 +9,13 @@ populated by fetch_postgres_docs.py:
 """
 
 import json
+import time
 import urllib.request
 from pathlib import Path
 
 DATA_SERVICE_URL = "http://localhost:8001"
 DOCS_DIR = Path(__file__).parent.parent / "docs_raw"
+DELAY_BETWEEN_FILES_SECONDS = 5
 
 
 def ingest_file(path: Path) -> None:
@@ -42,6 +44,7 @@ def main() -> None:
 
     for path in files:
         ingest_file(path)
+        time.sleep(DELAY_BETWEEN_FILES_SECONDS)
 
 
 if __name__ == "__main__":
