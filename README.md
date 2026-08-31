@@ -1,4 +1,4 @@
-# RAG Backend Tool — Project 2
+# RAG Backend Tool
 
 Full-split microservices RAG system. LLM answers questions grounded in a
 document knowledge base, currently the PostgreSQL official docs.

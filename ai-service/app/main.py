@@ -8,15 +8,18 @@ import os
 import re
 import time
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from google import genai
 from google.genai import errors as genai_errors
-from google.genai.types import EmbedContentConfig
+from google.genai.types import EmbedContentConfig, GenerateContentConfig
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_EMBEDDING_MODEL = os.environ.get("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
 GEMINI_EMBEDDING_DIM = int(os.environ.get("GEMINI_EMBEDDING_DIM", "768"))
+GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.6-flash")
+DATA_SERVICE_URL = os.environ.get("DATA_SERVICE_URL", "http://data-service:8000")
 
 app = FastAPI(title="rag-ai-service")
 
@@ -91,6 +94,80 @@ def embed(req: EmbedRequest):
     return EmbedResponse(embeddings=vectors)
 
 
+# ---------- answer (retrieve + generate) ----------
+
+class AnswerRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+
+class SourceChunk(BaseModel):
+    document_title: str
+    content: str
+    distance: float
+
+
+class AnswerResponse(BaseModel):
+    answer: str
+    sources: list[SourceChunk]
+
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant answering questions using only the "
+    "provided documentation excerpts below. If the excerpts don't contain "
+    "the answer, say so honestly instead of guessing or using outside "
+    "knowledge. Answer clearly and concisely."
+)
+
+
+def _retrieve_chunks(question: str, top_k: int) -> list[dict]:
+    with httpx.Client(timeout=30) as http_client:
+        resp = http_client.get(
+            f"{DATA_SERVICE_URL}/chunks/search",
+            params={"query": question, "top_k": top_k},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"data-service /chunks/search failed: {resp.text}")
+    return resp.json()
+
+
+def _build_prompt(question: str, chunks: list[dict]) -> str:
+    context = "\n\n".join(
+        f"[Source: {c['document_title']}]\n{c['content']}" for c in chunks
+    )
+    return (
+        f"--- Documentation excerpts ---\n{context}\n\n"
+        f"--- Question ---\n{question}"
+    )
+
+
+@app.post("/answer", response_model=AnswerResponse)
+def answer(req: AnswerRequest):
+    if not req.question.strip():
+        raise HTTPException(400, "question must not be empty")
+
+    chunks = _retrieve_chunks(req.question, req.top_k)
+    if not chunks:
+        raise HTTPException(404, "no relevant chunks found in the knowledge base")
+
+    client = get_client()
+    response = client.models.generate_content(
+        model=GEMINI_CHAT_MODEL,
+        contents=_build_prompt(req.question, chunks),
+        config=GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+    )
+
+    sources = [
+        SourceChunk(
+            document_title=c["document_title"],
+            content=c["content"][:200] + ("..." if len(c["content"]) > 200 else ""),
+            distance=c["distance"],
+        )
+        for c in chunks
+    ]
+
+    return AnswerResponse(answer=response.text, sources=sources)
+
+
 # TODO next:
-# POST /answer          -> full RAG flow: retrieve (via data-service) -> rerank -> generate
-# WS   /answer/stream     -> same, but streams tokens back (used by gateway)
+# WS /answer/stream -> same flow, but streams tokens back (used by gateway)
