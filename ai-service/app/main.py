@@ -9,16 +9,17 @@ import re
 import time
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from google import genai
 from google.genai import errors as genai_errors
-from google.genai.types import EmbedContentConfig, GenerateContentConfig
+from google.genai.types import EmbedContentConfig, GenerateContentConfig, ThinkingConfig
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_EMBEDDING_MODEL = os.environ.get("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
 GEMINI_EMBEDDING_DIM = int(os.environ.get("GEMINI_EMBEDDING_DIM", "768"))
 GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.6-flash")
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "LOW")
 DATA_SERVICE_URL = os.environ.get("DATA_SERVICE_URL", "http://data-service:8000")
 
 app = FastAPI(title="rag-ai-service")
@@ -154,7 +155,10 @@ def answer(req: AnswerRequest):
     response = client.models.generate_content(
         model=GEMINI_CHAT_MODEL,
         contents=_build_prompt(req.question, chunks),
-        config=GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        config=GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            thinking_config=ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
+        ),
     )
 
     sources = [
@@ -169,5 +173,82 @@ def answer(req: AnswerRequest):
     return AnswerResponse(answer=response.text, sources=sources)
 
 
-# TODO next:
-# WS /answer/stream -> same flow, but streams tokens back (used by gateway)
+# ---------- answer streaming (WebSocket) ----------
+
+async def _retrieve_chunks_async(question: str, top_k: int) -> list[dict]:
+    async with httpx.AsyncClient(timeout=30) as http_client:
+        resp = await http_client.get(
+            f"{DATA_SERVICE_URL}/chunks/search",
+            params={"query": question, "top_k": top_k},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"data-service /chunks/search failed: {resp.text}")
+    return resp.json()
+
+
+def _sources_payload(chunks: list[dict]) -> list[dict]:
+    return [
+        {
+            "document_title": c["document_title"],
+            "content": c["content"][:200] + ("..." if len(c["content"]) > 200 else ""),
+            "distance": c["distance"],
+        }
+        for c in chunks
+    ]
+
+
+@app.websocket("/answer/stream")
+async def answer_stream(websocket: WebSocket):
+    """
+    Protocol: client sends {"question": "...", "top_k": 5} as JSON.
+    Server sends a sequence of JSON messages back:
+      {"type": "token", "text": "..."}   - zero or more, as the answer streams in
+      {"type": "done", "sources": [...]} - once generation finishes
+      {"type": "error", "message": "..."} - on any failure for that question
+    The connection stays open for follow-up questions until the client disconnects.
+    """
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_json()
+            question = (data.get("question") or "").strip()
+            top_k = data.get("top_k", 5)
+
+            if not question:
+                await websocket.send_json({"type": "error", "message": "question must not be empty"})
+                continue
+
+            try:
+                chunks = await _retrieve_chunks_async(question, top_k)
+            except Exception as e:
+                await websocket.send_json({"type": "error", "message": str(e)})
+                continue
+
+            if not chunks:
+                await websocket.send_json(
+                    {"type": "error", "message": "no relevant chunks found in the knowledge base"}
+                )
+                continue
+
+            client = get_client()
+            prompt = _build_prompt(question, chunks)
+
+            try:
+                stream = await client.aio.models.generate_content_stream(
+                    model=GEMINI_CHAT_MODEL,
+                    contents=prompt,
+                    config=GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        thinking_config=ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
+                    ),
+                )
+                async for chunk in stream:
+                    if chunk.text:
+                        await websocket.send_json({"type": "token", "text": chunk.text})
+            except genai_errors.ClientError as e:
+                await websocket.send_json({"type": "error", "message": str(e)})
+                continue
+
+            await websocket.send_json({"type": "done", "sources": _sources_payload(chunks)})
+    except WebSocketDisconnect:
+        pass
