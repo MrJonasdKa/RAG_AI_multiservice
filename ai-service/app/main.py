@@ -100,6 +100,7 @@ def embed(req: EmbedRequest):
 class AnswerRequest(BaseModel):
     question: str
     top_k: int = 5
+    conversation_id: str | None = None
 
 
 class SourceChunk(BaseModel):
@@ -111,13 +112,15 @@ class SourceChunk(BaseModel):
 class AnswerResponse(BaseModel):
     answer: str
     sources: list[SourceChunk]
+    conversation_id: str
 
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant answering questions using only the "
     "provided documentation excerpts below. If the excerpts don't contain "
     "the answer, say so honestly instead of guessing or using outside "
-    "knowledge. Answer clearly and concisely."
+    "knowledge. Answer clearly and concisely. Use the prior conversation "
+    "(if any) to understand follow-up questions in context."
 )
 
 
@@ -132,11 +135,42 @@ def _retrieve_chunks(question: str, top_k: int) -> list[dict]:
     return resp.json()
 
 
-def _build_prompt(question: str, chunks: list[dict]) -> str:
+def _create_conversation() -> str:
+    with httpx.Client(timeout=15) as http_client:
+        resp = http_client.post(f"{DATA_SERVICE_URL}/conversations")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"data-service /conversations failed: {resp.text}")
+    return resp.json()["conversation_id"]
+
+
+def _get_history(conversation_id: str) -> list[dict]:
+    with httpx.Client(timeout=15) as http_client:
+        resp = http_client.get(f"{DATA_SERVICE_URL}/conversations/{conversation_id}/messages")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"data-service get messages failed: {resp.text}")
+    return resp.json()
+
+
+def _save_message(conversation_id: str, role: str, content: str) -> None:
+    with httpx.Client(timeout=15) as http_client:
+        resp = http_client.post(
+            f"{DATA_SERVICE_URL}/conversations/{conversation_id}/messages",
+            json={"role": role, "content": content},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"data-service save message failed: {resp.text}")
+
+
+def _build_prompt(question: str, chunks: list[dict], history: list[dict] | None = None) -> str:
     context = "\n\n".join(
         f"[Source: {c['document_title']}]\n{c['content']}" for c in chunks
     )
+    history_block = ""
+    if history:
+        turns = "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in history)
+        history_block = f"--- Prior conversation ---\n{turns}\n\n"
     return (
+        f"{history_block}"
         f"--- Documentation excerpts ---\n{context}\n\n"
         f"--- Question ---\n{question}"
     )
@@ -151,15 +185,21 @@ def answer(req: AnswerRequest):
     if not chunks:
         raise HTTPException(404, "no relevant chunks found in the knowledge base")
 
+    conversation_id = req.conversation_id or _create_conversation()
+    history = _get_history(conversation_id) if req.conversation_id else []
+
     client = get_client()
     response = client.models.generate_content(
         model=GEMINI_CHAT_MODEL,
-        contents=_build_prompt(req.question, chunks),
+        contents=_build_prompt(req.question, chunks, history),
         config=GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             thinking_config=ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
         ),
     )
+
+    _save_message(conversation_id, "user", req.question)
+    _save_message(conversation_id, "assistant", response.text)
 
     sources = [
         SourceChunk(
@@ -170,7 +210,7 @@ def answer(req: AnswerRequest):
         for c in chunks
     ]
 
-    return AnswerResponse(answer=response.text, sources=sources)
+    return AnswerResponse(answer=response.text, sources=sources, conversation_id=conversation_id)
 
 
 # ---------- answer streaming (WebSocket) ----------
@@ -184,6 +224,32 @@ async def _retrieve_chunks_async(question: str, top_k: int) -> list[dict]:
     if resp.status_code != 200:
         raise RuntimeError(f"data-service /chunks/search failed: {resp.text}")
     return resp.json()
+
+
+async def _create_conversation_async() -> str:
+    async with httpx.AsyncClient(timeout=15) as http_client:
+        resp = await http_client.post(f"{DATA_SERVICE_URL}/conversations")
+    if resp.status_code != 200:
+        raise RuntimeError(f"data-service /conversations failed: {resp.text}")
+    return resp.json()["conversation_id"]
+
+
+async def _get_history_async(conversation_id: str) -> list[dict]:
+    async with httpx.AsyncClient(timeout=15) as http_client:
+        resp = await http_client.get(f"{DATA_SERVICE_URL}/conversations/{conversation_id}/messages")
+    if resp.status_code != 200:
+        raise RuntimeError(f"data-service get messages failed: {resp.text}")
+    return resp.json()
+
+
+async def _save_message_async(conversation_id: str, role: str, content: str) -> None:
+    async with httpx.AsyncClient(timeout=15) as http_client:
+        resp = await http_client.post(
+            f"{DATA_SERVICE_URL}/conversations/{conversation_id}/messages",
+            json={"role": role, "content": content},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"data-service save message failed: {resp.text}")
 
 
 def _sources_payload(chunks: list[dict]) -> list[dict]:
@@ -200,12 +266,15 @@ def _sources_payload(chunks: list[dict]) -> list[dict]:
 @app.websocket("/answer/stream")
 async def answer_stream(websocket: WebSocket):
     """
-    Protocol: client sends {"question": "...", "top_k": 5} as JSON.
+    Protocol: client sends {"question": "...", "top_k": 5, "conversation_id": "..."}
+    as JSON. conversation_id is optional — omit it to start a new conversation.
     Server sends a sequence of JSON messages back:
+      {"type": "conversation", "conversation_id": "..."} - sent once, first
       {"type": "token", "text": "..."}   - zero or more, as the answer streams in
       {"type": "done", "sources": [...]} - once generation finishes
       {"type": "error", "message": "..."} - on any failure for that question
     The connection stays open for follow-up questions until the client disconnects.
+    Pass the same conversation_id back on later questions to keep context.
     """
     await websocket.accept()
     try:
@@ -213,6 +282,7 @@ async def answer_stream(websocket: WebSocket):
             data = await websocket.receive_json()
             question = (data.get("question") or "").strip()
             top_k = data.get("top_k", 5)
+            requested_conversation_id = data.get("conversation_id")
 
             if not question:
                 await websocket.send_json({"type": "error", "message": "question must not be empty"})
@@ -230,8 +300,22 @@ async def answer_stream(websocket: WebSocket):
                 )
                 continue
 
+            try:
+                if requested_conversation_id:
+                    conversation_id = requested_conversation_id
+                    history = await _get_history_async(conversation_id)
+                else:
+                    conversation_id = await _create_conversation_async()
+                    history = []
+            except Exception as e:
+                await websocket.send_json({"type": "error", "message": str(e)})
+                continue
+
+            await websocket.send_json({"type": "conversation", "conversation_id": conversation_id})
+
             client = get_client()
-            prompt = _build_prompt(question, chunks)
+            prompt = _build_prompt(question, chunks, history)
+            answer_text_parts: list[str] = []
 
             try:
                 stream = await client.aio.models.generate_content_stream(
@@ -244,10 +328,17 @@ async def answer_stream(websocket: WebSocket):
                 )
                 async for chunk in stream:
                     if chunk.text:
+                        answer_text_parts.append(chunk.text)
                         await websocket.send_json({"type": "token", "text": chunk.text})
             except genai_errors.ClientError as e:
                 await websocket.send_json({"type": "error", "message": str(e)})
                 continue
+
+            try:
+                await _save_message_async(conversation_id, "user", question)
+                await _save_message_async(conversation_id, "assistant", "".join(answer_text_parts))
+            except Exception:
+                pass  # answer already delivered to the client; don't fail the turn over history logging
 
             await websocket.send_json({"type": "done", "sources": _sources_payload(chunks)})
     except WebSocketDisconnect:

@@ -8,6 +8,7 @@ never calls Gemini directly, keeping that boundary in one place.
 """
 
 import os
+import uuid
 from contextlib import asynccontextmanager
 
 import httpx
@@ -128,5 +129,85 @@ async def search_chunks(query: str, top_k: int = 5):
             content=r["content"],
             distance=r["distance"],
         )
+        for r in rows
+    ]
+
+
+# ---------- conversations & messages ----------
+
+class ConversationResponse(BaseModel):
+    conversation_id: str
+
+
+@app.post("/conversations", response_model=ConversationResponse)
+async def create_conversation():
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        conv_id = await conn.fetchval(
+            "INSERT INTO conversations DEFAULT VALUES RETURNING id"
+        )
+    return ConversationResponse(conversation_id=str(conv_id))
+
+
+class MessageRequest(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class MessageResponse(BaseModel):
+    message_id: str
+    role: str
+    content: str
+
+
+@app.post("/conversations/{conversation_id}/messages", response_model=MessageResponse)
+async def add_message(conversation_id: str, req: MessageRequest):
+    if req.role not in ("user", "assistant"):
+        raise HTTPException(400, "role must be 'user' or 'assistant'")
+
+    try:
+        conv_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(400, "invalid conversation_id")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM conversations WHERE id = $1", conv_uuid
+        )
+        if not exists:
+            raise HTTPException(404, "conversation not found")
+
+        msg_id = await conn.fetchval(
+            """
+            INSERT INTO messages (conversation_id, role, content)
+            VALUES ($1, $2, $3) RETURNING id
+            """,
+            conv_uuid,
+            req.role,
+            req.content,
+        )
+    return MessageResponse(message_id=str(msg_id), role=req.role, content=req.content)
+
+
+@app.get("/conversations/{conversation_id}/messages", response_model=list[MessageResponse])
+async def get_messages(conversation_id: str):
+    try:
+        conv_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(400, "invalid conversation_id")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, role, content FROM messages
+            WHERE conversation_id = $1
+            ORDER BY created_at ASC
+            """,
+            conv_uuid,
+        )
+    return [
+        MessageResponse(message_id=str(r["id"]), role=r["role"], content=r["content"])
         for r in rows
     ]
