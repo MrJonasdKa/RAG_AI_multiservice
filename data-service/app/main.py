@@ -211,3 +211,69 @@ async def get_messages(conversation_id: str):
         MessageResponse(message_id=str(r["id"]), role=r["role"], content=r["content"])
         for r in rows
     ]
+
+
+# ---------- feedback ----------
+
+class FeedbackRequest(BaseModel):
+    rating: int  # 1 (thumbs up) or -1 (thumbs down)
+
+
+class FeedbackResponse(BaseModel):
+    feedback_id: str
+    message_id: str
+    rating: int
+
+
+@app.post("/messages/{message_id}/feedback", response_model=FeedbackResponse)
+async def add_feedback(message_id: str, req: FeedbackRequest):
+    if req.rating not in (-1, 1):
+        raise HTTPException(400, "rating must be 1 or -1")
+
+    try:
+        msg_uuid = uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(400, "invalid message_id")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM messages WHERE id = $1", msg_uuid)
+        if not exists:
+            raise HTTPException(404, "message not found")
+
+        feedback_id = await conn.fetchval(
+            "INSERT INTO feedback (message_id, rating) VALUES ($1, $2) RETURNING id",
+            msg_uuid,
+            req.rating,
+        )
+
+    return FeedbackResponse(feedback_id=str(feedback_id), message_id=message_id, rating=req.rating)
+
+
+class FeedbackStats(BaseModel):
+    message_id: str
+    up: int
+    down: int
+
+
+@app.get("/messages/{message_id}/feedback", response_model=FeedbackStats)
+async def get_feedback(message_id: str):
+    try:
+        msg_uuid = uuid.UUID(message_id)
+    except ValueError:
+        raise HTTPException(400, "invalid message_id")
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE rating = 1) AS up,
+                COUNT(*) FILTER (WHERE rating = -1) AS down
+            FROM feedback
+            WHERE message_id = $1
+            """,
+            msg_uuid,
+        )
+
+    return FeedbackStats(message_id=message_id, up=row["up"], down=row["down"])

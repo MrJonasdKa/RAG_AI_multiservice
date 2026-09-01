@@ -52,11 +52,11 @@ docker compose exec gateway pytest
 - [x] Ingestion pipeline (chunking + metadata tagging)
 - [x] Embedding + storage via data-service
 - [x] Basic vector search endpoint (`GET /chunks/search`)
-- [ ] Hybrid retrieval (vector + BM25)
-- [ ] Re-ranking step
-- [ ] Source citations in answers
-- [ ] WebSocket streaming end-to-end (gateway -> ai-service -> client)
-- [ ] Conversation memory
+- [x] Hybrid retrieval (vector + BM25)
+- [x] Re-ranking step
+- [x] Source citations in answers
+- [x] WebSocket streaming end-to-end (gateway -> ai-service -> client)
+- [x] Conversation memory
 - [ ] Feedback loop (thumbs up/down)
 - [ ] Access control per document set
 - [ ] Caching for repeated queries
