@@ -106,7 +106,7 @@ class AnswerRequest(BaseModel):
 class SourceChunk(BaseModel):
     document_title: str
     content: str
-    distance: float
+    score: float
 
 
 class AnswerResponse(BaseModel):
@@ -205,7 +205,7 @@ def answer(req: AnswerRequest):
         SourceChunk(
             document_title=c["document_title"],
             content=c["content"][:200] + ("..." if len(c["content"]) > 200 else ""),
-            distance=c["distance"],
+            score=c["score"],
         )
         for c in chunks
     ]
@@ -257,7 +257,7 @@ def _sources_payload(chunks: list[dict]) -> list[dict]:
         {
             "document_title": c["document_title"],
             "content": c["content"][:200] + ("..." if len(c["content"]) > 200 else ""),
-            "distance": c["distance"],
+            "score": c["score"],
         }
         for c in chunks
     ]

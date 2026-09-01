@@ -13,16 +13,23 @@ CREATE TABLE IF NOT EXISTS documents (
 -- One row per chunk of a document, with its embedding
 -- 768 = gemini-embedding-001 output_dimensionality (see .env.example in ai-service)
 CREATE TABLE IF NOT EXISTS chunks (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id  UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    content      TEXT NOT NULL,
-    embedding    vector(768),
-    chunk_index  INT NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id   UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    content       TEXT NOT NULL,
+    embedding     vector(768),
+    chunk_index   INT NOT NULL,
+    -- keyword/full-text search side of hybrid retrieval (paired with the
+    -- embedding for vector search) — auto-maintained by Postgres, never
+    -- written to directly
+    search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS chunks_embedding_idx
     ON chunks USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS chunks_search_vector_idx
+    ON chunks USING gin (search_vector);
 
 -- Conversation history, for multi-turn follow-ups later
 CREATE TABLE IF NOT EXISTS conversations (

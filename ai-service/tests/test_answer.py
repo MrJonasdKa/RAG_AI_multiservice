@@ -13,7 +13,7 @@ FAKE_CHUNKS = [
         "document_id": "d1",
         "document_title": "indices",
         "content": "An index allows the database server to find rows faster.",
-        "distance": 0.12,
+        "score": 0.12,
     }
 ]
 

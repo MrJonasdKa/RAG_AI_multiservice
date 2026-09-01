@@ -99,37 +99,74 @@ class SearchResult(BaseModel):
     document_id: str
     document_title: str
     content: str
-    distance: float
+    score: float  # Reciprocal Rank Fusion score — higher is more relevant
+
+
+RRF_K = 60  # standard RRF damping constant; de-emphasizes low ranks without needing score normalization
 
 
 @app.get("/chunks/search", response_model=list[SearchResult])
-async def search_chunks(query: str, top_k: int = 5):
+async def search_chunks(query: str, top_k: int = 5, candidates: int = 20):
+    """
+    Hybrid retrieval: runs vector similarity search and PostgreSQL full-text
+    (keyword) search independently, then merges the two ranked lists with
+    Reciprocal Rank Fusion. RRF works on rank position rather than raw
+    scores, which sidesteps the problem that cosine distance and text-rank
+    scores live on completely different, non-comparable scales.
+    """
     query_embedding = (await _embed([query], task_type="RETRIEVAL_QUERY"))[0]
 
     pool = get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
+        vector_rows = await conn.fetch(
             """
-            SELECT c.id AS chunk_id, c.document_id, d.title AS document_title,
-                   c.content, c.embedding <=> $1 AS distance
+            SELECT c.id AS chunk_id, c.document_id, d.title AS document_title, c.content
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
             ORDER BY c.embedding <=> $1
             LIMIT $2
             """,
             query_embedding,
-            top_k,
+            candidates,
         )
+
+        keyword_rows = await conn.fetch(
+            """
+            SELECT c.id AS chunk_id, c.document_id, d.title AS document_title, c.content
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.search_vector @@ plainto_tsquery('english', $1)
+            ORDER BY ts_rank_cd(c.search_vector, plainto_tsquery('english', $1)) DESC
+            LIMIT $2
+            """,
+            query,
+            candidates,
+        )
+
+    rrf_scores: dict[str, float] = {}
+    chunk_info: dict[str, object] = {}
+
+    for rank, row in enumerate(vector_rows, start=1):
+        cid = str(row["chunk_id"])
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        chunk_info[cid] = row
+
+    for rank, row in enumerate(keyword_rows, start=1):
+        cid = str(row["chunk_id"])
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        chunk_info.setdefault(cid, row)
+
+    ranked_ids = sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)[:top_k]
 
     return [
         SearchResult(
-            chunk_id=str(r["chunk_id"]),
-            document_id=str(r["document_id"]),
-            document_title=r["document_title"],
-            content=r["content"],
-            distance=r["distance"],
+            chunk_id=cid,
+            document_id=str(chunk_info[cid]["document_id"]),
+            document_title=chunk_info[cid]["document_title"],
+            content=chunk_info[cid]["content"],
+            score=rrf_scores[cid],
         )
-        for r in rows
+        for cid in ranked_ids
     ]
 
 
