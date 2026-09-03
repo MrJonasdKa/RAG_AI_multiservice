@@ -42,6 +42,7 @@ class IngestRequest(BaseModel):
     title: str
     source: str | None = None
     content: str
+    access_group: str | None = None  # None = visible to everyone
 
 
 class IngestResponse(BaseModel):
@@ -73,9 +74,10 @@ async def ingest_document(req: IngestRequest):
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
         doc_id = await conn.fetchval(
-            "INSERT INTO documents (title, source) VALUES ($1, $2) RETURNING id",
+            "INSERT INTO documents (title, source, access_group) VALUES ($1, $2, $3) RETURNING id",
             req.title,
             req.source,
+            req.access_group,
         )
         for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             await conn.execute(
@@ -106,13 +108,18 @@ RRF_K = 60  # standard RRF damping constant; de-emphasizes low ranks without nee
 
 
 @app.get("/chunks/search", response_model=list[SearchResult])
-async def search_chunks(query: str, top_k: int = 5, candidates: int = 20):
+async def search_chunks(query: str, top_k: int = 5, candidates: int = 20, access_group: str | None = None):
     """
     Hybrid retrieval: runs vector similarity search and PostgreSQL full-text
     (keyword) search independently, then merges the two ranked lists with
     Reciprocal Rank Fusion. RRF works on rank position rather than raw
     scores, which sidesteps the problem that cosine distance and text-rank
     scores live on completely different, non-comparable scales.
+
+    access_group scopes results to public documents (access_group IS NULL)
+    plus documents matching the given group — omit it to see public
+    documents only. This is a simple v1 placeholder for real per-user/role
+    access control.
     """
     query_embedding = (await _embed([query], task_type="RETRIEVAL_QUERY"))[0]
 
@@ -123,11 +130,13 @@ async def search_chunks(query: str, top_k: int = 5, candidates: int = 20):
             SELECT c.id AS chunk_id, c.document_id, d.title AS document_title, c.content
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
+            WHERE d.access_group IS NULL OR d.access_group = $3
             ORDER BY c.embedding <=> $1
             LIMIT $2
             """,
             query_embedding,
             candidates,
+            access_group,
         )
 
         keyword_rows = await conn.fetch(
@@ -136,11 +145,13 @@ async def search_chunks(query: str, top_k: int = 5, candidates: int = 20):
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
             WHERE c.search_vector @@ plainto_tsquery('english', $1)
+              AND (d.access_group IS NULL OR d.access_group = $3)
             ORDER BY ts_rank_cd(c.search_vector, plainto_tsquery('english', $1)) DESC
             LIMIT $2
             """,
             query,
             candidates,
+            access_group,
         )
 
     rrf_scores: dict[str, float] = {}
