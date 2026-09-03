@@ -4,10 +4,16 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 -- One row per document ingested into the knowledge base
 CREATE TABLE IF NOT EXISTS documents (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title       TEXT NOT NULL,
-    source      TEXT,              -- e.g. url or file path it came from
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title         TEXT NOT NULL,
+    source        TEXT,              -- e.g. url or file path it came from
+    -- Simple v1 access scoping: NULL = visible to everyone. A non-null
+    -- value restricts the document to callers who pass a matching
+    -- X-Access-Group header. This is a lightweight placeholder for real
+    -- per-user/role auth, which would layer on top once the frontend and
+    -- an actual auth system exist.
+    access_group  TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- One row per chunk of a document, with its embedding
